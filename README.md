@@ -1,7 +1,3 @@
-To create a `README.md` file for the provided Python script, here is a structured and detailed example:
-
----
-
 # Drug Discovery Pipeline
 
 This repository contains an **end-to-end drug discovery pipeline** implemented using DeepChem, TensorFlow, and RDKit. The pipeline is designed to facilitate molecular property prediction, active learning, and compound screening for drug discovery.
