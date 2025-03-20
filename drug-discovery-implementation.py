@@ -14,7 +14,15 @@ from deepchem.data import NumpyDataset
 from sklearn.model_selection import train_test_split
 import tensorflow as tf
 import keras
+from keras import backend as K
+from keras.models import load_model
 
+# New: Import necessary libraries for Google Drive access
+from google.colab import drive
+
+# Check TensorFlow version and GPU availability
+print("TensorFlow version:", tf.__version__)
+print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
 
 class DrugDiscoveryPipeline:
     """
@@ -47,32 +55,57 @@ class DrugDiscoveryPipeline:
         self.test_dataset = None
         self.unlabeled_pool = None
         self.active_learning_history = []
-        self.tasks = None
+        # Initialize tasks at creation time
+        self.tasks = ["activity"]
 
-    def load_data(self, smiles_list=None, labels=None, compound_file=None):
+    def load_data(self, smiles_list=None, labels=None, compound_file=None, test_size=0.2, valid_size=0.1):
         """Load and preprocess the dataset."""
         if smiles_list is None and compound_file is None:
             raise ValueError("Provide either smiles_list or compound_file")
+        
+        # Set tasks at the beginning to ensure it's defined
+        self.tasks = ["activity"]
+        print(f"Setting tasks to: {self.tasks}")
+        
         # Load compounds from file
         if compound_file:
+            print(f"Attempting to load from file: {compound_file}")
+            
+            # Check if file exists
+            if not os.path.exists(compound_file):
+                raise ValueError(f"File not found: {compound_file}")
+                
             if compound_file.endswith('.csv'):
-                df = pd.read_csv(compound_file)
-                if 'smiles' in df.columns and 'label' in df.columns:
-                    smiles_list = df['smiles'].tolist()
-                    labels = df['label'].tolist()
-                    # Convert labels to a numpy array of shape (n_samples, 1)
+                try:
+                    df = pd.read_csv(compound_file)
+                    print(f"CSV loaded successfully. Columns: {df.columns.tolist()}")
+                    print(f"First few rows:\n{df.head()}")
+                    
+                    if 'smiles' in df.columns and 'label' in df.columns:
+                        smiles_list = df['smiles'].tolist()
+                        labels = df['label'].tolist()
+                        # Convert labels to a numpy array of shape (n_samples, 1)
+                        labels = np.array(labels)
+                        labels = labels.reshape(-1, 1)
+                        print(f"Found {len(smiles_list)} compounds with labels")
+                    else:
+                        raise ValueError(f"CSV file must contain 'smiles' and 'label' columns. Found: {df.columns.tolist()}")
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    raise ValueError(f"Error reading CSV file: {e}")
+
+            elif compound_file.endswith('.sdf'):
+                try:
+                    suppl = Chem.SDMolSupplier(compound_file)
+                    mols = [mol for mol in suppl if mol is not None]
+                    smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
+                    # Extract properties or labels from SDF if available
+                    labels = [int(mol.GetProp('activity')) if mol.HasProp('activity') else 0 for mol in mols]
                     labels = np.array(labels)
                     labels = labels.reshape(-1, 1)
-                else:
-                    raise ValueError("CSV file must contain 'smiles' and 'label' columns")
-            elif compound_file.endswith('.sdf'):
-                suppl = Chem.SDMolSupplier(compound_file)
-                mols = [mol for mol in suppl if mol is not None]
-                smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-                # Extract properties or labels from SDF if available
-                labels = [int(mol.GetProp('activity')) if mol.HasProp('activity') else 0 for mol in mols]
-                labels = np.array(labels)
-                labels = labels.reshape(-1, 1)
+                except Exception as e:
+                    raise ValueError(f"Error reading SDF file: {e}")
             else:
                 raise ValueError("Unsupported file format. Use CSV or SDF.")
         else:
@@ -80,52 +113,76 @@ class DrugDiscoveryPipeline:
                 raise ValueError("Provide label list and smiles list.")
         print(f"Loading custom dataset...")
 
+        # Confirm tasks are set before proceeding
+        print(f"Tasks before featurization: {self.tasks}")
+
         # Choose featurizer
         featurizer = MolGraphConvFeaturizer()
 
         # Featurize the molecules
-        features = featurizer.featurize(smiles_list)
+        try:
+            features = featurizer.featurize(smiles_list)
+            print(f"Featurized {len(features)} molecules successfully")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise ValueError(f"Error featurizing molecules: {e}")
 
         # Convert to numpy arrays if needed
-        X = features
+        X = np.array([f.adj for f in features]) # Properly extract adjacency matrices
         y = np.array(labels)
         ids = np.array(smiles_list)  # Use SMILES as IDs
 
         # Split data
         if self.split_type == "scaffold" and len(smiles_list) > 10:
             # For scaffold splitting, first convert to molecules
-            mols = [Chem.MolFromSmiles(s) for s in smiles_list]
-            splitter = ScaffoldSplitter()
-            train_idx, valid_idx, test_idx = splitter.split(mols, frac_train=0.7, frac_valid=0.15, frac_test=0.15)
-
+            try:
+                mols = [Chem.MolFromSmiles(s) for s in smiles_list]
+                splitter = ScaffoldSplitter()
+                train_idx, valid_idx, test_idx = splitter.split(mols, frac_train=0.7, frac_valid=0.15, frac_test=0.15)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                raise ValueError(f"Error performing scaffold split: {e}")
             # Create datasets based on indices
-            train_X = [X[i] for i in train_idx]
-            valid_X = [X[i] for i in valid_idx]
-            test_X = [X[i] for i in test_idx]
+            train_X = X[train_idx]
+            valid_X = X[valid_idx]
+            test_X = X[test_idx]
+            train_y = y[train_idx]
+            valid_y = y[valid_idx]
+            test_y = y[test_idx]
+            train_ids = ids[train_idx]
+            valid_ids = ids[valid_idx]
+            test_ids = ids[test_idx]
 
-            self.train_dataset = NumpyDataset(train_X, y[train_idx], ids=ids[train_idx])
-            self.valid_dataset = NumpyDataset(valid_X, y[valid_idx], ids=ids[valid_idx])
-            self.test_dataset = NumpyDataset(test_X, y[test_idx], ids=ids[test_idx])
+            self.train_dataset = NumpyDataset(train_X, train_y, ids=train_ids)
+            self.valid_dataset = NumpyDataset(valid_X, valid_y, ids=valid_ids)
+            self.test_dataset = NumpyDataset(test_X, test_y, ids=test_ids)
         else:
             # Random split
             indices = list(range(len(smiles_list)))
-            train_idx, temp_idx = train_test_split(indices, test_size=0.3, random_state=42)
-            valid_idx, test_idx = train_test_split(temp_idx, test_size=0.5, random_state=42)
+            train_idx, temp_idx = train_test_split(indices, test_size=test_size, random_state=42)
+            valid_idx, test_idx = train_test_split(temp_idx, test_size=valid_size / (test_size + valid_size), random_state=42)
 
-            # Create DeepChem datasets - handle list of features
-            train_X = [X[i] for i in train_idx]
-            valid_X = [X[i] for i in valid_idx]
-            test_X = [X[i] for i in test_idx]
+            # Create DeepChem datasets
+            train_X = X[train_idx]
+            valid_X = X[valid_idx]
+            test_X = X[test_idx]
+            train_y = y[train_idx]
+            valid_y = y[valid_idx]
+            test_y = y[test_idx]
+            train_ids = ids[train_idx]
+            valid_ids = ids[valid_idx]
+            test_ids = ids[test_idx]
 
-            self.train_dataset = NumpyDataset(train_X, y[train_idx], ids=ids[train_idx])
-            self.valid_dataset = NumpyDataset(valid_X, y[valid_idx], ids=ids[valid_idx])
-            self.test_dataset = NumpyDataset(test_X, y[test_idx], ids=ids[test_idx])
+            self.train_dataset = NumpyDataset(train_X, train_y, ids=train_ids)
+            self.valid_dataset = NumpyDataset(valid_X, valid_y, ids=valid_ids)
+            self.test_dataset = NumpyDataset(test_X, test_y, ids=test_ids)
 
-        self.tasks = ["activity"]
 
         print(f"Dataset loaded with {len(self.train_dataset)} training samples,",
               f"{len(self.valid_dataset)} validation samples, and {len(self.test_dataset)} test samples.")
-        print(f"Tasks: {self.tasks}")
+        print(f"Tasks after data loading: {self.tasks}")
 
         # Analyze dataset
         self._analyze_dataset()
@@ -135,11 +192,25 @@ class DrugDiscoveryPipeline:
     def _analyze_dataset(self):
         """Analyze the dataset and print statistics."""
         # Count positives and negatives in training set
+        if self.train_dataset is None or len(self.train_dataset) == 0:
+            print("Warning: Training dataset is empty.  Cannot analyze.")
+            return
+
         y_train = self.train_dataset.y
         n_tasks = len(self.tasks)
 
         print("\nDataset statistics:")
+
+        # Check if y_train has the expected shape (n_samples, n_tasks)
+        if y_train.ndim == 1:
+             print("Reshaping y_train to (n_samples, 1)")
+             y_train = y_train.reshape(-1, 1)  # Reshape to (n_samples, 1)
+
         for i, task in enumerate(self.tasks):
+            # Add a check to prevent IndexError
+            if i >= y_train.shape[1]:
+                print(f"Warning: Task index {i} is out of bounds for y_train. Skipping task.")
+                continue  # Skip to the next task
             positives = np.sum(y_train[:, i] == 1)
             negatives = np.sum(y_train[:, i] == 0)
             print(f"Task '{task}': {positives} positives, {negatives} negatives")
@@ -149,11 +220,17 @@ class DrugDiscoveryPipeline:
         """
         Build and compile a Graph Convolutional Network model.
         """
+        # Double-check tasks is defined
         if self.tasks is None:
-            raise ValueError("Tasks have not been loaded. Call load_data() first.")
+            print("WARNING: Tasks is None in build_model(), setting default")
+            self.tasks = ["activity"]
+            
+        print(f"Building model with tasks: {self.tasks}")
 
         if n_tasks is None:
             n_tasks = len(self.tasks)
+            
+        print(f"Using n_tasks = {n_tasks}")
 
         # Determine the model type (classification or regression)
         model_type = "classification"
@@ -195,10 +272,9 @@ class DrugDiscoveryPipeline:
             Number of epochs to wait for improvement before stopping
         """
         if self.model is None:
-            raise ValueError("Model has not been built yet. Call build_model() first.")
+            raise ValueError("Model has not been built yet. Call load_data() first.")
 
         print(f"Training model for up to {epochs} epochs with patience={patience}...")
-
         # Define metric
         if self.model.mode == "classification":
             metric = dc.metrics.Metric(dc.metrics.roc_auc_score)
@@ -281,14 +357,21 @@ class DrugDiscoveryPipeline:
 
         # Load external compounds
         if external_compounds_file.endswith('.csv'):
-            df = pd.read_csv(external_compounds_file)
-            if 'smiles' in df.columns:
-                smiles_list = df['smiles'].tolist()
-            else:
-                raise ValueError("CSV file must contain a 'smiles' column")
+            try:
+                df = pd.read_csv(external_compounds_file)
+                if 'smiles' in df.columns:
+                    smiles_list = df['smiles'].tolist()
+                else:
+                    raise ValueError("CSV file must contain a 'smiles' column")
+            except Exception as e:
+                raise ValueError(f"Error reading external CSV file: {e}")
         elif external_compounds_file.endswith('.sdf'):
-            suppl = Chem.SDMolSupplier(external_compounds_file)
-            smiles_list = [Chem.MolToSmiles(mol) for mol in suppl if mol is not None]
+            try:
+                suppl = Chem.SDMolSupplier(external_compounds_file)
+                smiles_list = [Chem.MolToSmiles(mol) for mol in suppl if mol is not None]
+            except Exception as e:
+                raise ValueError(f"Error reading external SDF file: {e}")
+
         else:
             raise ValueError("Unsupported file format. Use CSV or SDF.")
 
@@ -296,7 +379,11 @@ class DrugDiscoveryPipeline:
 
         # Featurize the compounds
         featurizer = MolGraphConvFeaturizer()
-        X = featurizer.featurize(smiles_list)
+
+        try:
+            X = featurizer.featurize(smiles_list)
+        except Exception as e:
+            raise ValueError(f"Error featurizing external molecules: {e}")
         y = np.zeros((len(X), len(self.tasks)))  # Initialize with placeholder labels
         ids = np.array(smiles_list)
 
@@ -308,7 +395,7 @@ class DrugDiscoveryPipeline:
         initial_size = min(initial_size, len(self.train_dataset))
 
         # Extract the initial training subset
-        initial_X = [self.train_dataset.X[i] for i in range(initial_size)]
+        initial_X = self.train_dataset.X[:initial_size]
         initial_y = self.train_dataset.y[:initial_size]
         initial_ids = self.train_dataset.ids[:initial_size]
 
@@ -318,6 +405,7 @@ class DrugDiscoveryPipeline:
         print(f"Active learning initialized with {initial_size} compounds and batch size {batch_size}.")
 
         return self
+        
     def run_active_learning_cycle(self, n_cycles=5, oracle_function=None):
         """
         Run active learning cycles to iteratively improve the model.
@@ -333,7 +421,6 @@ class DrugDiscoveryPipeline:
         if not self.active_learning:
             print("Active learning is disabled. Skipping.")
             return self
-
         if self.unlabeled_pool is None:
             raise ValueError("Active learning has not been set up. Call setup_active_learning() first.")
 
@@ -362,7 +449,6 @@ class DrugDiscoveryPipeline:
             # Select compounds for the next batch
             selected_indices = self._select_compounds(batch_size=self.al_batch_size)
             selected_smiles = [self.unlabeled_pool.ids[i] for i in selected_indices]
-
             print(f"Selected {len(selected_smiles)} compounds for labeling.")
 
             if oracle_function is not None:
@@ -370,570 +456,174 @@ class DrugDiscoveryPipeline:
                 new_labels = oracle_function(selected_smiles)
 
                 # Create a new dataset with the selected compounds
-                selected_X = [self.unlabeled_pool.X[i] for i in selected_indices]
+                selected_X = self.unlabeled_pool.X[selected_indices]
                 selected_y = np.array(new_labels).reshape(-1, len(self.tasks))
                 selected_ids = np.array(selected_smiles)
 
                 new_data = NumpyDataset(selected_X, selected_y, ids=selected_ids)
 
-                # Merge with existing active learning set
+                # Merge new data with active learning set
                 self.active_learning_set = dc.data.NumpyDataset.merge([self.active_learning_set, new_data])
 
                 # Remove selected compounds from unlabeled pool
                 mask = np.ones(len(self.unlabeled_pool), dtype=bool)
                 mask[selected_indices] = False
 
-                X_remaining = [self.unlabeled_pool.X[i] for i in range(len(self.unlabeled_pool)) if mask[i]]
+                X_remaining = self.unlabeled_pool.X[mask]
                 y_remaining = self.unlabeled_pool.y[mask]
                 ids_remaining = self.unlabeled_pool.ids[mask]
 
                 self.unlabeled_pool = NumpyDataset(X_remaining, y_remaining, ids=ids_remaining)
 
-                # Track the history
-                self.active_learning_history.append({
-                    'cycle': cycle+1,
-                    'test_score': np.mean(list(test_score.values())),
-                    'selected_compounds': selected_smiles,
-                    'pool_size': len(self.unlabeled_pool)
-                })
+                print(f"Unlabeled_pool size reduced to {len(self.unlabeled_pool)} samples.")
 
-                print(f"Updated active learning set to {len(self.active_learning_set)} compounds.")
-                print(f"Unlabeled pool now contains {len(self.unlabeled_pool)} compounds.")
             else:
-                print("No oracle function provided. Selected compounds:")
-                for smiles in selected_smiles:
-                    print(f"- {smiles}")
-                print("Active learning simulation without updating the model.")
+                print("Oracle function not provided. Skipping labeling and updating active learning set.")
 
-        # Plot active learning history
-        if oracle_function is not None and self.active_learning_history:
-            self._plot_active_learning_history()
+            # Store active learning history (optional)
+            self.active_learning_history.append({
+                'cycle': cycle + 1,
+                'selected_smiles': selected_smiles,
+                'test_score': np.mean(list(test_score.values()))
+            })
 
         return self
-    def _select_compounds(self, batch_size=10, strategy="uncertainty"):
-        """
-        Select compounds from the unlabeled pool using various strategies.
 
-        Parameters
-        ----------
-        batch_size : int
-            Number of compounds to select
-        strategy : str
-            Selection strategy ('uncertainty', 'diversity', or 'random')
+    def _select_compounds(self, batch_size):
+        """Select compounds from the unlabeled pool using uncertainty sampling."""
+        if not self.active_learning:
+            raise ValueError("Active learning is disabled.")
+        if self.unlabeled_pool is None:
+            raise ValueError("Unlabeled pool has not been initialized.")
 
-        Returns
-        -------
-        list
-            Indices of selected compounds
-        """
-        if strategy == "random":
-            return np.random.choice(len(self.unlabeled_pool), batch_size, replace=False)
+        # Predict probabilities for all compounds in the unlabeled pool
+        predictions = self.model.predict(self.unlabeled_pool)
 
-        # Get predictions and uncertainties for all compounds in the pool
-        y_pred, uncertainty = self._get_uncertainty(self.unlabeled_pool)
+        # Uncertainty sampling: select compounds with probabilities closest to 0.5
+        if self.model.mode == "classification":
+            uncertainties = np.abs(predictions - 0.5)
+        else:  # Regression
+            uncertainties = np.abs(predictions - np.mean(predictions))
 
-        if strategy == "uncertainty":
-            # Select compounds with highest uncertainty
-            selected_indices = np.argsort(-uncertainty)[:batch_size]
-        elif strategy == "diversity":
-            # Implement diversity-based selection (e.g., k-means clustering)
-            # This is a simplified version using only uncertainty
-            selected_indices = []
+        # Rank compounds by uncertainty
+        ranked_indices = np.argsort(uncertainties.flatten())
 
-            # First, select the compound with highest uncertainty
-            selected_indices.append(np.argmax(uncertainty))
-
-            # Then select the rest based on a combination of uncertainty and diversity
-            remaining = list(range(len(self.unlabeled_pool)))
-            remaining.remove(selected_indices[0])
-
-            while len(selected_indices) < batch_size and remaining:
-                best_idx = -1
-                best_score = -np.inf
-
-                for idx in remaining:
-                    # Score is a combination of uncertainty and diversity from already selected
-                    score = uncertainty[idx]
-                    best_idx = idx if score > best_score else best_idx
-                    best_score = max(score, best_score)
-
-                if best_idx >= 0:
-                    selected_indices.append(best_idx)
-                    remaining.remove(best_idx)
-                else:
-                    break
-        else:
-            raise ValueError(f"Unknown selection strategy: {strategy}")
+        # Select the top batch_size most uncertain compounds
+        selected_indices = ranked_indices[:batch_size]
+        print(f"Selected {len(selected_indices)} compounds based on uncertainty.")
 
         return selected_indices
-    def _get_uncertainty(self, dataset):
+
+    def visualize_compounds(self, smiles_list, filename="compounds.png", mols_per_row=5):
+        """Visualize a list of compounds and save the image."""
+        mols = [Chem.MolFromSmiles(s) for s in smiles_list]
+        img = Draw.MolsToGridImage(mols, molsPerRow=mols_per_row, subImgSize=(200, 200))
+        img.save(filename)
+        print(f"Compound visualization saved to {filename}")
+        return self
+
+    def test_model(self):
         """
-        Get prediction uncertainty for all compounds in a dataset.
-
-        Parameters
-        ----------
-        dataset : dc.data.Dataset
-            Dataset to get uncertainty for
-
-        Returns
-        -------
-        tuple
-            (predictions, uncertainty)
+        Test the model on the test dataset and print the performance metrics.
         """
-        y_pred = self.model.predict(dataset)
+        if self.model is None:
+            raise ValueError("Model has not been built yet. Call build_model() first.")
 
+        # Define metric
         if self.model.mode == "classification":
-            # For binary classification, uncertainty is highest at p=0.5
-            uncertainty = -np.abs(y_pred - 0.5)
+            metric = dc.metrics.Metric(dc.metrics.roc_auc_score)
         else:
-            # For regression, we don't have a good uncertainty measure
-            # without using ensemble or dropout. Use a random value for now.
-            uncertainty = np.random.random(len(dataset))
-        
-        return y_pred, uncertainty
-    def _plot_active_learning_history(self):
-        """Plot the active learning history."""
-        if not self.active_learning_history:
-            print("No active learning history to plot.")
-            return
+            metric = dc.metrics.Metric(dc.metrics.r2_score)
 
-        cycles = [h['cycle'] for h in self.active_learning_history]
-        scores = [h['test_score'] for h in self.active_learning_history]
-        pool_sizes = [h['pool_size'] for h in self.active_learning_history]
+        test_score = self.model.evaluate(self.test_dataset, [metric])
+        print(f"Test score: {np.mean(list(test_score.values())):.4f}")
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        # Generate plots if classification
+        if self.model.mode == "classification":
+            # Get predictions on the test set
+            preds = self.model.predict(self.test_dataset)
+            y_true = self.test_dataset.y.flatten()  # Ground truth labels
+            y_scores = preds.flatten()
 
-        # Plot test scores
-        ax1.plot(cycles, scores, 'o-', markersize=8)
-        ax1.set_xlabel('Active Learning Cycle')
-        ax1.set_ylabel('Test Score')
-        ax1.set_title('Performance vs. Active Learning Cycle')
-        ax1.grid(True)
-
-        # Plot pool size
-        ax2.plot(cycles, pool_sizes, 's-', markersize=8, color='green')
-        ax2.set_xlabel('Active Learning Cycle')
-        ax2.set_ylabel('Unlabeled Pool Size')
-        ax2.set_title('Unlabeled Pool Size vs. Cycle')
-        ax2.grid(True)
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.model.model_dir, 'active_learning_history.png'))
-        plt.close()
-    def predict(self, smiles_list):
-        """
-        Make predictions for a list of SMILES strings.
-
-        Parameters
-        ----------
-        smiles_list : list
-            List of SMILES strings to make predictions for
-
-        Returns
-        -------
-        numpy.ndarray
-            Array of predictions
-        """
-        if self.model is None:
-            raise ValueError("Model has not been trained. Call train_model() first.")
-
-        # Featurize molecules
-        featurizer = MolGraphConvFeaturizer()
-        features = featurizer.featurize(smiles_list)
-
-        # Create dataset
-        X = features
-        y = np.zeros((len(X), len(self.tasks)))  # Placeholder labels
-        ids = np.array(smiles_list)
-        dataset = NumpyDataset(X, y, ids=ids)
-
-        # Make predictions
-        return self.model.predict(dataset)
-       
-    def visualize_predictions(self, smiles_list, labels=None, n_per_row=4, conf_threshold=0.5):
-        """
-        Visualize molecules with their predictions.
-
-        Parameters
-        ----------
-        smiles_list : list
-            List of SMILES strings to visualize
-        labels : list, optional
-            True labels for the molecules, if available
-        n_per_row : int
-            Number of molecules per row in the visualization
-        conf_threshold : float
-            Confidence threshold for coloring predictions
-        """
-        # Convert SMILES to RDKit molecules
-        mols = [Chem.MolFromSmiles(smiles) for smiles in smiles_list]
-
-        # Make predictions
-        preds = self.predict(smiles_list)
-
-        # Prepare visualization
-        n_mols = len(mols)
-        n_rows = (n_mols + n_per_row - 1) // n_per_row
-
-        # Add prediction information to the molecules
-        legends = []
-        for i, (mol, pred) in enumerate(zip(mols, preds)):
-            prediction = pred[0]  # Assuming single task
-
-            if self.model.mode == "classification":
-                label = f"Pred: {prediction:.2f}"
-                if labels is not None:
-                    label += f", True: {labels[i]}"
-                legends.append(label)
-
-                # Color atoms based on prediction
-                if prediction >= conf_threshold:
-                    color = (0, 1, 0)  # Green for active (high confidence)
-                elif prediction <= 1 - conf_threshold:
-                    color = (1, 0, 0)  # Red for inactive (high confidence)
-                else:
-                    color = (0.7, 0.7, 0)  # Yellow for uncertain
-            else:
-                # For regression
-                label = f"Pred: {prediction:.2f}"
-                if labels is not None:
-                    label += f", True: {labels[i]:.2f}"
-                legends.append(label)
-
-        # Generate image
-        img = Draw.MolsToGridImage(mols, molsPerRow=n_per_row, subImgSize=(200, 200),
-                                  legends=legends)
-
-        # Save and display image
-        img_file = os.path.join(self.model.model_dir, 'predicted_molecules.png')
-        img.save(img_file)
-
-        return img
-    def evaluate_model(self, dataset=None, metrics=None):
-        """
-        Evaluate the model on a dataset.
-
-        Parameters
-        ----------
-        dataset : dc.data.Dataset, optional
-            Dataset to evaluate on. If None, uses the test dataset.
-        metrics : list, optional
-            List of metrics to evaluate. If None, uses default metrics.
-
-        Returns
-        -------
-        dict
-            Dictionary of metric results
-        """
-        if self.model is None:
-            raise ValueError("Model has not been trained. Call train_model() first.")
-
-        if dataset is None:
-            dataset = self.test_dataset
-
-        if metrics is None:
-            if self.model.mode == "classification":
-                metrics = [
-                    dc.metrics.Metric(dc.metrics.roc_auc_score),
-                    dc.metrics.Metric(dc.metrics.prc_auc_score),
-                    dc.metrics.Metric(dc.metrics.accuracy_score),
-                    dc.metrics.Metric(dc.metrics.recall_score),
-                    dc.metrics.Metric(dc.metrics.precision_score)
-                ]
-            else:
-                metrics = [
-                    dc.metrics.Metric(dc.metrics.r2_score),
-                    dc.metrics.Metric(dc.metrics.mean_squared_error),
-                    dc.metrics.Metric(dc.metrics.mean_absolute_error)
-                ]
-
-        results = self.model.evaluate(dataset, metrics)
-
-        print("\nModel Evaluation Results:")
-        for name, value in results.items():
-            print(f"{name}: {value:.4f}")
-
-        return results
-
-    def plot_roc_curve(self):
-        """Plot the ROC curve for the model."""
-        if self.model.mode != "classification":
-            print("ROC curve is only available for classification models.")
-            return
-
-        # Get predictions and true labels
-        y_true = self.test_dataset.y
-        y_pred = self.model.predict(self.test_dataset)
-
-        # Compute ROC curve and ROC area for each task
-        plt.figure(figsize=(10, 8))
-
-        for i, task in enumerate(self.tasks):
-            fpr, tpr, _ = roc_curve(y_true[:, i], y_pred[:, i])
+            # ROC curve
+            fpr, tpr, thresholds = roc_curve(y_true, y_scores)
             roc_auc = auc(fpr, tpr)
 
-            plt.plot(fpr, tpr, label=f'{task} (AUC = {roc_auc:.3f})')
+            plt.figure(figsize=(8, 6))
+            plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title('Receiver Operating Characteristic')
+            plt.legend(loc="lower right")
+            plt.savefig(os.path.join(self.model.model_dir, 'roc_curve.png'))
 
-        plt.plot([0, 1], [0, 1], 'k--')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('Receiver Operating Characteristic')
-        plt.legend(loc="lower right")
-        plt.grid(True, alpha=0.3)
+            # Precision-Recall curve
+            precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
+            pr_auc = auc(recall, precision)
 
-        # Save figure
-        plt.savefig(os.path.join(self.model.model_dir, 'roc_curve.png'))
-        plt.close()
-def plot_precision_recall_curve(self):
-    """Plot the Precision-Recall curve for the model."""
-    if self.model.mode != "classification":
-        print("Precision-Recall curve is only available for classification models.")
-        return
+            plt.figure(figsize=(8, 6))
+            plt.plot(recall, precision, color='blue', lw=2, label=f'PR curve (area = {pr_auc:.2f})')
+            plt.xlabel('Recall')
+            plt.ylabel('Precision')
+            plt.title('Precision-Recall Curve')
+            plt.legend(loc="lower left")
+            plt.savefig(os.path.join(self.model.model_dir, 'pr_curve.png'))
 
-    # Get predictions and true labels
-    y_true = self.test_dataset.y
-    y_pred = self.model.predict(self.test_dataset)
+        return self
 
-    # Compute Precision-Recall curve and area for each task
-    plt.figure(figsize=(10, 8))
+# Mount Google Drive
+drive.mount('/content/drive')
 
-    for i, task in enumerate(self.tasks):
-        precision, recall, _ = precision_recall_curve(y_true[:, i], y_pred[:, i])
-        pr_auc = auc(recall, precision)
+# Example usage: Replace with your actual file path
+file_path = '/content/drive/MyDrive/bace(1).csv'  # Or your .sdf file
 
-        plt.plot(recall, precision, label=f'{task} (AUC = {pr_auc:.3f})')
+# Check if file exists before proceeding
+if not os.path.exists(file_path):
+    print(f"ERROR: File not found: {file_path}")
+    print("Available files in directory:")
+    if os.path.exists('/content/drive/MyDrive'):
+        print(os.listdir('/content/drive/MyDrive'))
+    exit()
+else:
+    print(f"File found: {file_path}")
+    
+    # Check file contents
+    if file_path.endswith('.csv'):
+        try:
+            test_df = pd.read_csv(file_path)
+            print(f"CSV preview:\n{test_df.head()}")
+            print(f"Columns: {test_df.columns.tolist()}")
+        except Exception as e:
+            print(f"Error previewing CSV: {e}")
+            exit()
 
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall Curve')
-    plt.legend(loc="lower left")
-    plt.grid(True, alpha=0.3)
+# Instantiate the pipeline with explicit initialization of tasks
+pipeline = DrugDiscoveryPipeline(dataset_name="MyDataset", featurizer_type="graph_conv", split_type="scaffold", active_learning=False)
+print(f"Pipeline created with tasks: {pipeline.tasks}")
 
-    # Save figure
-    plt.savefig(os.path.join(self.model.model_dir, 'precision_recall_curve.png'))
-    plt.close()
-
-def analyze_important_features(self, smiles_list=None, n_features=10):
-    """
-    Analyze important molecular features for predictions.
+# Load the data from Google Drive with improved error handling
+try:
+    pipeline.load_data(compound_file=file_path)
+    print(f"After loading, tasks = {pipeline.tasks}")
     
-    Note: This is a placeholder method as feature importance analysis
-    requires model-specific implementations.
+    # Verify tasks are set
+    if pipeline.tasks is None:
+        print("WARNING: Tasks is still None after loading data, setting it manually")
+        pipeline.tasks = ["activity"]
     
-    Parameters
-    ----------
-    smiles_list : list, optional
-        List of SMILES strings to analyze. If None, uses test set.
-    n_features : int
-        Number of top features to return
+    # Build the model
+    pipeline.build_model(n_tasks=1, model_dir="./my_model", batch_size=128, learning_rate=0.001, n_layers=2)
     
-    Returns
-    -------
-    dict
-        Dictionary of important features and their scores
-    """
-    print("Feature importance analysis is not implemented for this model type.")
-    print("Consider using model-specific attribution methods or SHAP values.")
+    # Train the model
+    pipeline.train_model(epochs=10, patience=3)
     
-    return {}
-
-def save_model(self, filename=None):
-    """
-    Save the trained model to disk.
+    # Test the model
+    pipeline.test_model()
     
-    Parameters
-    ----------
-    filename : str, optional
-        Path to save the model. If None, uses default path.
-    
-    Returns
-    -------
-    str
-        Path to the saved model
-    """
-    if self.model is None:
-        raise ValueError("No model to save. Train the model first.")
-    
-    if filename is None:
-        filename = os.path.join(self.model.model_dir, 'final_model')
-    
-    self.model.save_checkpoint(model_dir=filename)
-    print(f"Model saved to {filename}")
-    return filename
-
-def load_model(self, filename):
-    """
-    Load a previously trained model from disk.
-    
-    Parameters
-    ----------
-    filename : str
-        Path to the saved model
-    
-    Returns
-    -------
-    self
-        The pipeline object with loaded model
-    """
-    if self.tasks is None:
-        raise ValueError("Tasks not defined. Load data first.")
-    
-    # Rebuild the model structure
-    self.build_model()
-    
-    # Restore weights
-    self.model.restore(model_dir=filename)
-    print(f"Model loaded from {filename}")
-    return self
-
-def export_predictions(self, smiles_list, output_file):
-    """
-    Export model predictions to a CSV file.
-    
-    Parameters
-    ----------
-    smiles_list : list
-        List of SMILES strings to make predictions for
-    output_file : str
-        Path to save predictions
-    
-    Returns
-    -------
-    str
-        Path to the saved predictions
-    """
-    if self.model is None:
-        raise ValueError("No model available. Train or load a model first.")
-    
-    # Make predictions
-    preds = self.predict(smiles_list)
-    
-    # Create a DataFrame
-    df = pd.DataFrame({
-        'smiles': smiles_list
-    })
-    
-    # Add predictions for each task
-    for i, task in enumerate(self.tasks):
-        df[f'{task}_score'] = preds[:, i]
-    
-    # Save to CSV
-    df.to_csv(output_file, index=False)
-    print(f"Predictions saved to {output_file}")
-    return output_file
-
-def screen_virtual_library(self, library_file, output_file=None, conf_threshold=0.5):
-    """
-    Screen a virtual library of compounds and rank them by prediction scores.
-    
-    Parameters
-    ----------
-    library_file : str
-        Path to CSV or SDF file containing compounds to screen
-    output_file : str, optional
-        Path to save screening results
-    conf_threshold : float
-        Confidence threshold for binary classification
-    
-    Returns
-    -------
-    pandas.DataFrame
-        DataFrame with screening results
-    """
-    if self.model is None:
-        raise ValueError("No model available. Train or load a model first.")
-    
-    # Load compounds
-    if library_file.endswith('.csv'):
-        df = pd.read_csv(library_file)
-        if 'smiles' in df.columns:
-            smiles_list = df['smiles'].tolist()
-        else:
-            raise ValueError("CSV file must contain a 'smiles' column")
-    elif library_file.endswith('.sdf'):
-        suppl = Chem.SDMolSupplier(library_file)
-        smiles_list = [Chem.MolToSmiles(mol) for mol in suppl if mol is not None]
-    else:
-        raise ValueError("Unsupported file format. Use CSV or SDF.")
-    
-    print(f"Screening {len(smiles_list)} compounds...")
-    
-    # Make predictions
-    preds = self.predict(smiles_list)
-    
-    # Create a DataFrame
-    results = pd.DataFrame({
-        'smiles': smiles_list
-    })
-    
-    # Add predictions for each task
-    for i, task in enumerate(self.tasks):
-        results[f'{task}_score'] = preds[:, i]
-        
-        # For classification, add binary prediction
-        if self.model.mode == "classification":
-            results[f'{task}_active'] = (preds[:, i] >= conf_threshold).astype(int)
-    
-    # Sort by prediction score (descending)
-    results = results.sort_values(by=f'{self.tasks[0]}_score', ascending=False)
-    
-    # Save results if output file is provided
-    if output_file:
-        results.to_csv(output_file, index=False)
-        print(f"Screening results saved to {output_file}")
-    
-    return results
-    def run_full_pipeline(self, training_file, external_file=None, output_dir="./output", 
-                     n_active_learning_cycles=3, oracle_function=None):
-      """
-      Run the full drug discovery pipeline from data loading to active learning.
-      
-      Parameters
-      ----------
-      training_file : str
-          Path to training data file (CSV or SDF)
-      external_file : str, optional
-          Path to external compounds for active learning
-      output_dir : str
-          Directory to save results
-      n_active_learning_cycles : int
-          Number of active learning cycles to run
-      oracle_function : callable, optional
-          Function to simulate experimental validation
-      
-      Returns
-      -------
-      self
-          The pipeline instance
-      """
-      # Create output directory
-      os.makedirs(output_dir, exist_ok=True)
-      model_dir = os.path.join(output_dir, "model")
-      
-      # Load and preprocess data
-      self.load_data(compound_file=training_file)
-      
-      # Build and train the model
-      self.build_model(model_dir=model_dir)
-      self.train_model(epochs=100, patience=10)
-      
-      # Evaluate the model
-      self.evaluate_model()
-      self.plot_roc_curve()
-      self.plot_precision_recall_curve()
-      
-      # Save the model
-      self.save_model()
-      
-      # Setup active learning if enabled
-      if self.active_learning and external_file:
-          self.setup_active_learning(external_file, batch_size=10)
-          self.run_active_learning_cycle(n_cycles=n_active_learning_cycles, 
-                                        oracle_function=oracle_function)
-      
-      print("Pipeline completed successfully!")
-      return self
+except Exception as e:
+    print(f"ERROR during pipeline execution: {str(e)}")
+    import traceback
+    traceback.print_exc()
